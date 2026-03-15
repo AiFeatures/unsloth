@@ -1,6 +1,6 @@
 # Fork Customizations
 
-> This repository is a fork of [unknown]().
+> This repository is a fork of [unslothai/unsloth](https://github.com/unslothai/unsloth).
 > Managed under the [iAiFy Enterprise](https://github.com/enterprises/iAiFy) governance model.
 
 ## Purpose
@@ -11,7 +11,7 @@ Fine-tuning & Reinforcement Learning for LLMs. 🦥 Train OpenAI gpt-oss, DeepSe
 
 | Property | Value |
 |----------|-------|
-| Upstream | [unknown]() |
+| Upstream | [unslothai/unsloth](https://github.com/unslothai/unsloth) |
 | Language | Python |
 | Fork org | AiFeatures |
 
