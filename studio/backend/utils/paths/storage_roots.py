@@ -3,12 +3,18 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import tempfile
 
 
 def studio_root() -> Path:
     return Path.home() / ".unsloth" / "studio"
+
+
+def cache_root() -> Path:
+    """Central cache directory for all studio downloads (models, datasets, etc.)."""
+    return Path.home() / ".unsloth" / "studio" / "cache"
 
 
 def assets_root() -> Path:
@@ -48,11 +54,15 @@ def tmp_root() -> Path:
 
 
 def seed_uploads_root() -> Path:
-    return tmp_root() / "seed-uploads"
+    return datasets_root() / "seed-uploads"
 
 
 def unstructured_seed_cache_root() -> Path:
     return tmp_root() / "unstructured-seed-cache"
+
+
+def unstructured_uploads_root() -> Path:
+    return datasets_root() / "unstructured-uploads"
 
 
 def oxc_validator_tmp_root() -> Path:
@@ -68,6 +78,28 @@ def ensure_dir(path: Path) -> Path:
     return path
 
 
+def _setup_cache_env() -> None:
+    """Set cache environment variables for HuggingFace, uv, and vLLM.
+
+    Only sets variables that are not already set by the user, so
+    explicit overrides (e.g. HF_HOME=/data/hf) are respected.
+    Works on Linux, macOS, and Windows.
+    """
+    root = cache_root()
+    hf_dir = root / "huggingface"
+    defaults = {
+        "HF_HOME": str(hf_dir),
+        "HF_HUB_CACHE": str(hf_dir / "hub"),
+        "HF_XET_CACHE": str(hf_dir / "xet"),
+        "UV_CACHE_DIR": str(root / "uv"),
+        "VLLM_CACHE_ROOT": str(root / "vllm"),
+    }
+    for key, value in defaults.items():
+        if key not in os.environ:
+            os.environ[key] = value
+            Path(value).mkdir(parents = True, exist_ok = True)
+
+
 def ensure_studio_directories() -> None:
     """Create all standard studio directories on startup."""
     for dir_fn in (
@@ -76,12 +108,14 @@ def ensure_studio_directories() -> None:
         datasets_root,
         dataset_uploads_root,
         recipe_datasets_root,
+        unstructured_uploads_root,
         outputs_root,
         exports_root,
         auth_root,
         tensorboard_root,
     ):
         ensure_dir(dir_fn())
+    _setup_cache_env()
 
 
 def _clean_relative_path(

@@ -41,6 +41,10 @@ class ModelCheckpoints(BaseModel):
         None,
         description = "LoRA rank (r) if applicable",
     )
+    is_quantized: bool = Field(
+        False,
+        description = "Whether the model uses BNB quantization (e.g. bnb-4bit)",
+    )
 
 
 class CheckpointListResponse(BaseModel):
@@ -84,6 +88,12 @@ class ModelDetails(BaseModel):
     )
     base_model: Optional[str] = Field(
         None, description = "Base model if this is a LoRA adapter"
+    )
+    max_position_embeddings: Optional[int] = Field(
+        None, description = "Maximum context length supported by the model"
+    )
+    model_size_bytes: Optional[int] = Field(
+        None, description = "Total size of model weight files in bytes"
     )
 
 
@@ -129,6 +139,9 @@ class GgufVariantDetail(BaseModel):
     )
     quant: str = Field(..., description = "Quantization label (e.g., 'Q4_K_M')")
     size_bytes: int = Field(0, description = "File size in bytes")
+    downloaded: bool = Field(
+        False, description = "Whether this variant is already in the local HF cache"
+    )
 
 
 class GgufVariantsResponse(BaseModel):
