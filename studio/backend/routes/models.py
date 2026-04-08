@@ -49,8 +49,10 @@ try:
     )
     from core.inference import get_inference_backend
     from utils.paths import (
+        is_local_path,
         outputs_root,
         exports_root,
+        resolve_cached_repo_id_case,
         resolve_output_dir,
         resolve_export_dir,
     )
@@ -77,8 +79,10 @@ except ImportError:
     )
     from core.inference import get_inference_backend
     from utils.paths import (
+        is_local_path,
         outputs_root,
         exports_root,
+        resolve_cached_repo_id_case,
         resolve_output_dir,
         resolve_export_dir,
     )
@@ -94,7 +98,13 @@ from models import (
     LoRAInfo,
     ModelListResponse,
 )
-from models.models import GgufVariantDetail, GgufVariantsResponse, ModelType
+from models.models import (
+    GgufVariantDetail,
+    GgufVariantsResponse,
+    ModelType,
+    ScanFolderInfo,
+    AddScanFolderRequest,
+)
 from models.responses import (
     LoRABaseModelResponse,
     VisionCheckResponse,
@@ -128,21 +138,90 @@ def _resolve_hf_cache_dir() -> Path:
         return Path.home() / ".cache" / "huggingface" / "hub"
 
 
-def _scan_models_dir(models_dir: Path) -> List[LocalModelInfo]:
+def _is_model_directory(d: Path) -> bool:
+    """Return ``True`` when *d* looks like a model directory.
+
+    A model directory must have **both** a config file (``config.json`` or
+    ``adapter_config.json``) **and** actual model weight files.  Both
+    conditions are required: a bare directory with only loose ``.gguf``
+    files (no config) might be a mixed collection, and a ``config.json``
+    alone (no weights) is not a model directory.
+
+    Excludes ``mmproj`` GGUF files (vision projectors) and non-weight
+    ``.bin`` files (``tokenizer.bin``, ``vocab.bin``, etc.) from the
+    weight check to avoid false positives.
+    """
+
+    def _is_weight_file(f: Path) -> bool:
+        suffix = f.suffix.lower()
+        if suffix == ".safetensors":
+            return True
+        if suffix == ".gguf":
+            return "mmproj" not in f.name.lower()
+        if suffix == ".bin":
+            name = f.name.lower()
+            return (
+                name.startswith("pytorch_model")
+                or name.startswith("model")
+                or name.startswith("adapter_model")
+                or name.startswith("consolidated")
+            )
+        return False
+
+    try:
+        has_config = (d / "config.json").exists() or (
+            d / "adapter_config.json"
+        ).exists()
+        if not has_config:
+            return False
+        return any(_is_weight_file(f) for f in d.iterdir() if f.is_file())
+    except OSError:
+        return False
+
+
+def _scan_models_dir(
+    models_dir: Path,
+    *,
+    limit: int | None = None,
+) -> List[LocalModelInfo]:
     if not models_dir.exists() or not models_dir.is_dir():
         return []
 
+    _is_self_model = _is_model_directory(models_dir)
+
+    if _is_self_model:
+        try:
+            updated_at = models_dir.stat().st_mtime
+        except OSError:
+            updated_at = None
+        return [
+            LocalModelInfo(
+                id = str(models_dir),
+                display_name = models_dir.name,
+                path = str(models_dir),
+                source = "models_dir",
+                updated_at = updated_at,
+            ),
+        ]
+
     found: List[LocalModelInfo] = []
     for child in models_dir.iterdir():
-        if not child.is_dir():
+        if limit is not None and len(found) >= limit:
+            break
+        try:
+            if not child.is_dir():
+                continue
+            has_model_files = (
+                (child / "config.json").exists()
+                or (child / "adapter_config.json").exists()
+                or any(child.glob("*.safetensors"))
+                or any(child.glob("*.bin"))
+                or any(child.glob("*.gguf"))
+            )
+        except OSError:
+            # Skip individual children that are unreadable (permissions, broken
+            # symlinks, etc.) rather than failing the entire scan.
             continue
-        has_model_files = (
-            (child / "config.json").exists()
-            or (child / "adapter_config.json").exists()
-            or any(child.glob("*.safetensors"))
-            or any(child.glob("*.bin"))
-            or any(child.glob("*.gguf"))
-        )
         if not has_model_files:
             continue
         try:
@@ -159,21 +238,24 @@ def _scan_models_dir(models_dir: Path) -> List[LocalModelInfo]:
             ),
         )
     # Also scan for standalone .gguf files directly in the models directory
-    for gguf_file in models_dir.glob("*.gguf"):
-        if gguf_file.is_file():
-            try:
-                updated_at = gguf_file.stat().st_mtime
-            except OSError:
-                updated_at = None
-            found.append(
-                LocalModelInfo(
-                    id = str(gguf_file),
-                    display_name = gguf_file.stem,
-                    path = str(gguf_file),
-                    source = "models_dir",
-                    updated_at = updated_at,
-                ),
-            )
+    if limit is None or len(found) < limit:
+        for gguf_file in models_dir.glob("*.gguf"):
+            if limit is not None and len(found) >= limit:
+                break
+            if gguf_file.is_file():
+                try:
+                    updated_at = gguf_file.stat().st_mtime
+                except OSError:
+                    updated_at = None
+                found.append(
+                    LocalModelInfo(
+                        id = str(gguf_file),
+                        display_name = gguf_file.stem,
+                        path = str(gguf_file),
+                        source = "models_dir",
+                        updated_at = updated_at,
+                    ),
+                )
 
     return found
 
@@ -210,6 +292,121 @@ def _scan_hf_cache(cache_dir: Path) -> List[LocalModelInfo]:
     return found
 
 
+def _scan_lmstudio_dir(lm_dir: Path) -> List[LocalModelInfo]:
+    """Scan an LM Studio models directory for model files.
+
+    LM Studio uses a ``publisher/model-name`` folder structure containing
+    GGUF files, or standalone GGUF files at the top level.
+    """
+    if not lm_dir.exists() or not lm_dir.is_dir():
+        return []
+
+    # If the directory itself is a model directory (has config AND weight
+    # files), it is not an LM Studio publisher structure -- return it as a
+    # single model entry.  We cannot skip it silently because this function
+    # is the only scanner called for default LM Studio roots.
+    if _is_model_directory(lm_dir):
+        try:
+            updated_at = lm_dir.stat().st_mtime
+        except OSError:
+            updated_at = None
+        return [
+            LocalModelInfo(
+                id = str(lm_dir),
+                display_name = lm_dir.name,
+                path = str(lm_dir),
+                source = "lmstudio",
+                updated_at = updated_at,
+            ),
+        ]
+
+    found: List[LocalModelInfo] = []
+    for child in lm_dir.iterdir():
+        try:
+            if not child.is_dir():
+                if child.suffix == ".gguf" and child.is_file():
+                    try:
+                        updated_at = child.stat().st_mtime
+                    except OSError:
+                        updated_at = None
+                    found.append(
+                        LocalModelInfo(
+                            id = str(child),
+                            display_name = child.stem,
+                            path = str(child),
+                            source = "lmstudio",
+                            updated_at = updated_at,
+                        ),
+                    )
+                continue
+
+            # If the child directory itself looks like a model directory
+            # (has config AND weight files), surface it directly instead
+            # of descending into it as a publisher.
+            if _is_model_directory(child):
+                try:
+                    updated_at = child.stat().st_mtime
+                except OSError:
+                    updated_at = None
+                found.append(
+                    LocalModelInfo(
+                        id = str(child),
+                        display_name = child.name,
+                        path = str(child),
+                        source = "lmstudio",
+                        updated_at = updated_at,
+                    ),
+                )
+                continue
+
+            # child is a publisher directory -- scan its sub-directories
+            for model_dir in child.iterdir():
+                try:
+                    if model_dir.is_dir():
+                        has_model = (
+                            any(model_dir.glob("*.gguf"))
+                            or (model_dir / "config.json").exists()
+                            or any(model_dir.glob("*.safetensors"))
+                        )
+                        if not has_model:
+                            continue
+                        model_id = f"{child.name}/{model_dir.name}"
+                        try:
+                            updated_at = model_dir.stat().st_mtime
+                        except OSError:
+                            updated_at = None
+                        found.append(
+                            LocalModelInfo(
+                                id = str(model_dir),
+                                model_id = model_id,
+                                display_name = model_dir.name,
+                                path = str(model_dir),
+                                source = "lmstudio",
+                                updated_at = updated_at,
+                            ),
+                        )
+                    elif model_dir.suffix == ".gguf" and model_dir.is_file():
+                        try:
+                            updated_at = model_dir.stat().st_mtime
+                        except OSError:
+                            updated_at = None
+                        found.append(
+                            LocalModelInfo(
+                                id = str(model_dir),
+                                model_id = f"{child.name}/{model_dir.stem}",
+                                display_name = model_dir.stem,
+                                path = str(model_dir),
+                                source = "lmstudio",
+                                updated_at = updated_at,
+                            ),
+                        )
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return found
+
+
 @router.get("/local", response_model = LocalModelListResponse)
 async def list_local_models(
     models_dir: str = Query(
@@ -218,13 +415,29 @@ async def list_local_models(
     current_subject: str = Depends(get_current_subject),
 ):
     """
-    List local model candidates from custom models dir and HF cache.
+    List local model candidates from custom models dir, HF cache,
+    legacy Unsloth HF cache, and LM Studio directories.
     """
+    from utils.paths import (
+        legacy_hf_cache_dir,
+        hf_default_cache_dir,
+        lmstudio_model_dirs,
+    )
+
+    # Resolve all scan directories up front.
+    hf_cache_dir = _resolve_hf_cache_dir()
+    legacy_hf = legacy_hf_cache_dir()
+    hf_default = hf_default_cache_dir()
+    lm_dirs = lmstudio_model_dirs()
+
     # Validate models_dir against an allowlist of trusted directories.
     # Only the trusted Path objects are used for filesystem access -- the
     # user-supplied string is only used for matching, never for path construction.
-    hf_cache_dir = _resolve_hf_cache_dir()
-    allowed_roots = [Path("./models").resolve(), hf_cache_dir]
+    allowed_roots: list[Path] = [Path("./models").resolve(), hf_cache_dir]
+    if legacy_hf.is_dir():
+        allowed_roots.append(legacy_hf)
+    if hf_default.is_dir():
+        allowed_roots.append(hf_default)
     try:
         from utils.paths import studio_root, outputs_root
 
@@ -248,10 +461,55 @@ async def list_local_models(
     try:
         local_models = _scan_models_dir(models_root) + _scan_hf_cache(hf_cache_dir)
 
+        # Scan legacy Unsloth HF cache for backward compatibility
+        if legacy_hf.is_dir() and legacy_hf.resolve() != hf_cache_dir.resolve():
+            local_models += _scan_hf_cache(legacy_hf)
+
+        # Scan HF system default cache (may differ when env vars are overridden)
+        if (
+            hf_default.is_dir()
+            and hf_default.resolve() != hf_cache_dir.resolve()
+            and hf_default.resolve() != legacy_hf.resolve()
+        ):
+            local_models += _scan_hf_cache(hf_default)
+
+        # Scan LM Studio directories
+        for lm_dir in lm_dirs:
+            local_models += _scan_lmstudio_dir(lm_dir)
+
+        # Scan user-added custom folders (cap per-folder to avoid unbounded scans)
+        from storage.studio_db import list_scan_folders
+
+        _MAX_MODELS_PER_FOLDER = 200
+        try:
+            custom_folders = list_scan_folders()
+        except Exception as e:
+            logger.warning("Could not load custom scan folders: %s", e)
+            custom_folders = []
+        for folder in custom_folders:
+            folder_path = Path(folder["path"])
+            try:
+                custom_models = (
+                    _scan_models_dir(folder_path, limit = _MAX_MODELS_PER_FOLDER)
+                    + _scan_hf_cache(folder_path)
+                    + _scan_lmstudio_dir(folder_path)
+                )[:_MAX_MODELS_PER_FOLDER]
+            except OSError as e:
+                logger.warning("Skipping unreadable scan folder %s: %s", folder_path, e)
+                continue
+            local_models += [
+                m.model_copy(update = {"source": "custom"}) for m in custom_models
+            ]
+
+        # Deduplicate models, but always keep custom folder entries so they
+        # appear in the "Custom Folders" UI section even when the same model
+        # also exists in the HF cache or default models directory.  Use a
+        # (id, source) key for custom entries to avoid collisions.
         deduped: dict[str, LocalModelInfo] = {}
         for model in local_models:
-            if model.id not in deduped:
-                deduped[model.id] = model
+            key = f"{model.id}\x00custom" if model.source == "custom" else model.id
+            if key not in deduped:
+                deduped[key] = model
 
         models = sorted(
             deduped.values(),
@@ -262,6 +520,7 @@ async def list_local_models(
         return LocalModelListResponse(
             models_dir = str(models_root),
             hf_cache_dir = str(hf_cache_dir),
+            lmstudio_dirs = [str(d) for d in lm_dirs],
             models = models,
         )
     except Exception as e:
@@ -270,6 +529,46 @@ async def list_local_models(
             status_code = 500,
             detail = f"Failed to list local models: {str(e)}",
         )
+
+
+@router.get("/scan-folders")
+async def get_scan_folders(
+    current_subject: str = Depends(get_current_subject),
+):
+    """List all registered custom model scan folders."""
+    from storage.studio_db import list_scan_folders
+
+    return {"folders": list_scan_folders()}
+
+
+@router.post("/scan-folders", response_model = ScanFolderInfo, status_code = 201)
+async def add_scan_folder_endpoint(
+    body: AddScanFolderRequest,
+    current_subject: str = Depends(get_current_subject),
+):
+    """Register a new directory to scan for local models."""
+    from storage.studio_db import add_scan_folder
+
+    try:
+        folder = add_scan_folder(body.path)
+    except ValueError as e:
+        logger.warning("Scan folder rejected: %s (path=%s)", e, body.path)
+        raise HTTPException(status_code = 400, detail = str(e))
+    logger.info("Scan folder added: %s", folder.get("path"))
+    return folder
+
+
+@router.delete("/scan-folders/{folder_id}")
+async def remove_scan_folder_endpoint(
+    folder_id: int,
+    current_subject: str = Depends(get_current_subject),
+):
+    """Remove a registered custom scan folder."""
+    from storage.studio_db import remove_scan_folder
+
+    remove_scan_folder(folder_id)
+    logger.info("Scan folder removed: id=%s", folder_id)
+    return {"ok": True}
 
 
 @router.get("/list")
@@ -398,10 +697,15 @@ async def get_model_config(
     This endpoint wraps the backend load_model_defaults function.
     """
     try:
-        from utils.models.model_config import is_local_path
-
         if not is_local_path(model_name):
-            model_name = model_name.lower()
+            resolved = resolve_cached_repo_id_case(model_name)
+            if resolved != model_name:
+                logger.info(
+                    "Using cached repo_id casing '%s' for requested '%s'",
+                    resolved,
+                    model_name,
+                )
+            model_name = resolved
 
         logger.info(f"Getting model config for: {model_name}")
         from utils.models.model_config import detect_audio_type
@@ -410,7 +714,7 @@ async def get_model_config(
         config_dict = load_model_defaults(model_name)
 
         # Detect model capabilities (pass HF token for gated models)
-        is_vision = is_vision_model(model_name)
+        is_vision = is_vision_model(model_name, hf_token = hf_token)
         is_embedding = is_embedding_model(model_name, hf_token = hf_token)
         audio_type = detect_audio_type(model_name, hf_token = hf_token)
 
@@ -622,13 +926,40 @@ async def get_gguf_variants(
     current_subject: str = Depends(get_current_subject),
 ):
     """
-    List available GGUF quantization variants for a HuggingFace repo.
+    List available GGUF quantization variants for a HuggingFace repo
+    or a local directory (e.g. LM Studio model folder).
 
     Returns all available quantization variants (Q4_K_M, Q8_0, BF16, etc.)
     with file sizes, whether the model supports vision, and the recommended
     default variant.
     """
     try:
+        from utils.models.model_config import is_local_path, list_local_gguf_variants
+
+        # Local directory path (e.g. LM Studio models) — scan filesystem
+        if is_local_path(repo_id):
+            variants, has_vision = list_local_gguf_variants(repo_id)
+
+            filenames = [v.filename for v in variants]
+            best = _pick_best_gguf(filenames)
+            default_variant = _extract_quant_label(best) if best else None
+
+            return GgufVariantsResponse(
+                repo_id = repo_id,
+                variants = [
+                    GgufVariantDetail(
+                        filename = v.filename,
+                        quant = v.quant,
+                        size_bytes = v.size_bytes,
+                        downloaded = True,  # all local variants are downloaded
+                    )
+                    for v in variants
+                ],
+                has_vision = has_vision,
+                default_variant = default_variant,
+            )
+
+        # Remote HuggingFace repo — query HF API
         variants, has_vision = list_gguf_variants(repo_id, hf_token = hf_token)
 
         # Determine default variant
@@ -846,46 +1177,65 @@ def _get_repo_size_cached(repo_id: str) -> int:
         return 0
 
 
+def _all_hf_cache_scans():
+    """Return scan_cache_dir results for the active, legacy, and default HF caches."""
+    from huggingface_hub import scan_cache_dir
+    from utils.paths import legacy_hf_cache_dir, hf_default_cache_dir
+
+    scans = [scan_cache_dir()]
+    seen: set[str] = set()
+    try:
+        # Resolve the active cache dir so we can dedup
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        seen.add(str(Path(HF_HUB_CACHE).resolve()))
+    except Exception:
+        pass
+
+    for extra_fn in (legacy_hf_cache_dir, hf_default_cache_dir):
+        extra = extra_fn()
+        if extra.is_dir() and str(extra.resolve()) not in seen:
+            seen.add(str(extra.resolve()))
+            try:
+                scans.append(scan_cache_dir(cache_dir = str(extra)))
+            except Exception as exc:
+                logger.warning("Could not scan HF cache %s: %s", extra, exc)
+    return scans
+
+
 @router.get("/cached-gguf")
 async def list_cached_gguf(
     current_subject: str = Depends(get_current_subject),
 ):
-    """List GGUF repos that have already been downloaded to the HF cache.
-
-    Uses scan_cache_dir() for proper repo IDs, then deduplicates by
-    lowercased key (HF cache dirs are lowercased but the canonical repo
-    ID preserves casing).
-    """
+    """List GGUF repos downloaded to HF cache, legacy Unsloth cache, and HF default cache."""
     try:
-        from huggingface_hub import scan_cache_dir
+        cache_scans = _all_hf_cache_scans()
 
-        hf_cache = scan_cache_dir()
         seen_lower: dict[str, dict] = {}
-        for repo_info in hf_cache.repos:
-            if repo_info.repo_type != "model":
-                continue
-            repo_id = repo_info.repo_id
-            if not repo_id.upper().endswith("-GGUF"):
-                continue
-            # Check for actual .gguf files and sum sizes
-            total_size = 0
-            has_gguf = False
-            for revision in repo_info.revisions:
-                for f in revision.files:
-                    if f.file_name.endswith(".gguf"):
-                        has_gguf = True
-                        total_size += f.size_on_disk
-            if not has_gguf:
-                continue
-            # Deduplicate: keep the entry with the most data
-            key = repo_id.lower()
-            existing = seen_lower.get(key)
-            if existing is None or total_size > existing["size_bytes"]:
-                seen_lower[key] = {
-                    "repo_id": repo_id,
-                    "size_bytes": total_size,
-                    "cache_path": str(repo_info.repo_path),
-                }
+        for hf_cache in cache_scans:
+            for repo_info in hf_cache.repos:
+                if repo_info.repo_type != "model":
+                    continue
+                repo_id = repo_info.repo_id
+                if not repo_id.upper().endswith("-GGUF"):
+                    continue
+                total_size = 0
+                has_gguf = False
+                for revision in repo_info.revisions:
+                    for f in revision.files:
+                        if f.file_name.endswith(".gguf"):
+                            has_gguf = True
+                            total_size += f.size_on_disk
+                if not has_gguf:
+                    continue
+                key = repo_id.lower()
+                existing = seen_lower.get(key)
+                if existing is None or total_size > existing["size_bytes"]:
+                    seen_lower[key] = {
+                        "repo_id": repo_id,
+                        "size_bytes": total_size,
+                        "cache_path": str(repo_info.repo_path),
+                    }
         cached = sorted(seen_lower.values(), key = lambda c: c["repo_id"])
         return {"cached": cached}
     except Exception as e:
@@ -897,44 +1247,39 @@ async def list_cached_gguf(
 async def list_cached_models(
     current_subject: str = Depends(get_current_subject),
 ):
-    """List non-GGUF model repos that have been downloaded to the HF cache.
-
-    Only includes repos that actually contain model weight files
-    (.safetensors, .bin), not repos with only config/metadata.
-    """
+    """List non-GGUF model repos downloaded to HF cache, legacy Unsloth cache, and HF default cache."""
     _WEIGHT_EXTENSIONS = (".safetensors", ".bin")
 
     try:
-        from huggingface_hub import scan_cache_dir
+        cache_scans = _all_hf_cache_scans()
 
-        hf_cache = scan_cache_dir()
         seen_lower: dict[str, dict] = {}
-        for repo_info in hf_cache.repos:
-            if repo_info.repo_type != "model":
-                continue
-            repo_id = repo_info.repo_id
-            if repo_id.upper().endswith("-GGUF"):
-                continue
-            total_size = sum(
-                f.size_on_disk for rev in repo_info.revisions for f in rev.files
-            )
-            if total_size == 0:
-                continue
-            # Skip repos that only have config/metadata files (no weights)
-            has_weights = any(
-                f.file_name.endswith(_WEIGHT_EXTENSIONS)
-                for rev in repo_info.revisions
-                for f in rev.files
-            )
-            if not has_weights:
-                continue
-            key = repo_id.lower()
-            existing = seen_lower.get(key)
-            if existing is None or total_size > existing["size_bytes"]:
-                seen_lower[key] = {
-                    "repo_id": repo_id,
-                    "size_bytes": total_size,
-                }
+        for hf_cache in cache_scans:
+            for repo_info in hf_cache.repos:
+                if repo_info.repo_type != "model":
+                    continue
+                repo_id = repo_info.repo_id
+                if repo_id.upper().endswith("-GGUF"):
+                    continue
+                total_size = sum(
+                    f.size_on_disk for rev in repo_info.revisions for f in rev.files
+                )
+                if total_size == 0:
+                    continue
+                has_weights = any(
+                    f.file_name.endswith(_WEIGHT_EXTENSIONS)
+                    for rev in repo_info.revisions
+                    for f in rev.files
+                )
+                if not has_weights:
+                    continue
+                key = repo_id.lower()
+                existing = seen_lower.get(key)
+                if existing is None or total_size > existing["size_bytes"]:
+                    seen_lower[key] = {
+                        "repo_id": repo_id,
+                        "size_bytes": total_size,
+                    }
         cached = sorted(seen_lower.values(), key = lambda c: c["repo_id"])
         return {"cached": cached}
     except Exception as e:
@@ -989,15 +1334,17 @@ async def delete_cached_model(
         pass
 
     try:
-        from huggingface_hub import scan_cache_dir
+        cache_scans = _all_hf_cache_scans()
 
-        hf_cache = scan_cache_dir()
         target_repo = None
-        for repo_info in hf_cache.repos:
-            if repo_info.repo_type != "model":
-                continue
-            if repo_info.repo_id.lower() == repo_id.lower():
-                target_repo = repo_info
+        for hf_cache in cache_scans:
+            for repo_info in hf_cache.repos:
+                if repo_info.repo_type != "model":
+                    continue
+                if repo_info.repo_id.lower() == repo_id.lower():
+                    target_repo = repo_info
+                    break
+            if target_repo is not None:
                 break
 
         if target_repo is None:

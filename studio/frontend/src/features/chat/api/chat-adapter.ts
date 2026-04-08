@@ -253,6 +253,7 @@ function waitForModelReady(abortSignal?: AbortSignal): Promise<void> {
  * falls back to smallest cached safetensors model.
  */
 async function autoLoadSmallestModel(): Promise<boolean> {
+  const hfToken = useChatRuntimeStore.getState().hfToken || null;
   const toastId = toast("Loading a model…", {
     description: "Auto-selecting the smallest downloaded model.",
     duration: 5000,
@@ -278,8 +279,8 @@ async function autoLoadSmallestModel(): Promise<boolean> {
             const variant = downloaded[0];
             const loadResp = await loadModel({
               model_path: repo.repo_id,
-              hf_token: null,
-              max_seq_length: 4096,
+              hf_token: hfToken,
+              max_seq_length: 0,
               load_in_4bit: true,
               is_lora: false,
               gguf_variant: variant.quant,
@@ -305,11 +306,15 @@ async function autoLoadSmallestModel(): Promise<boolean> {
             }
             useChatRuntimeStore.setState({
               ggufContextLength: loadResp.context_length ?? 131072,
+              ggufMaxContextLength: loadResp.max_context_length ?? loadResp.context_length ?? 131072,
               supportsReasoning: loadResp.supports_reasoning ?? false,
+              reasoningAlwaysOn: loadResp.reasoning_always_on ?? false,
               reasoningEnabled: loadResp.supports_reasoning ?? false,
               supportsTools: loadResp.supports_tools ?? false,
-              toolsEnabled: false,
-              codeToolsEnabled: false,
+              toolsEnabled: loadResp.supports_tools ?? false,
+              codeToolsEnabled: loadResp.supports_tools ?? false,
+              kvCacheDtype: loadResp.cache_type_kv ?? null,
+              loadedKvCacheDtype: loadResp.cache_type_kv ?? null,
               defaultChatTemplate: loadResp.chat_template ?? null,
               chatTemplateOverride: null,
             });
@@ -329,7 +334,7 @@ async function autoLoadSmallestModel(): Promise<boolean> {
         try {
           const sfLoadResp = await loadModel({
             model_path: repo.repo_id,
-            hf_token: null,
+            hf_token: hfToken,
             max_seq_length: 4096,
             load_in_4bit: true,
             is_lora: false,
@@ -366,8 +371,8 @@ async function autoLoadSmallestModel(): Promise<boolean> {
     try {
       const loadResp = await loadModel({
         model_path: "unsloth/Qwen3.5-4B-GGUF",
-        hf_token: null,
-        max_seq_length: 4096,
+        hf_token: hfToken,
+        max_seq_length: 0,
         load_in_4bit: true,
         is_lora: false,
         gguf_variant: "UD-Q4_K_XL",
@@ -388,10 +393,15 @@ async function autoLoadSmallestModel(): Promise<boolean> {
       }
       useChatRuntimeStore.setState({
         ggufContextLength: loadResp.context_length ?? 131072,
+        ggufMaxContextLength: loadResp.max_context_length ?? loadResp.context_length ?? 131072,
         supportsReasoning: loadResp.supports_reasoning ?? false,
+        reasoningAlwaysOn: loadResp.reasoning_always_on ?? false,
         reasoningEnabled: loadResp.supports_reasoning ?? false,
         supportsTools: loadResp.supports_tools ?? false,
-        toolsEnabled: false,
+        toolsEnabled: loadResp.supports_tools ?? false,
+        codeToolsEnabled: loadResp.supports_tools ?? false,
+        kvCacheDtype: loadResp.cache_type_kv ?? null,
+        loadedKvCacheDtype: loadResp.cache_type_kv ?? null,
         defaultChatTemplate: loadResp.chat_template ?? null,
         chatTemplateOverride: null,
       });
@@ -410,8 +420,11 @@ async function autoLoadSmallestModel(): Promise<boolean> {
 export function createOpenAIStreamAdapter(): ChatModelAdapter {
   return {
     async *run({ messages, abortSignal, unstable_threadId }) {
-      const runtime = useChatRuntimeStore.getState();
-      const { params } = runtime;
+      let runtime = useChatRuntimeStore.getState();
+      // Capture the thread ID once at the start so it stays stable even if
+      // the user switches chats while waiting for model load / auto-load.
+      const resolvedThreadId =
+        (unstable_threadId ?? runtime.activeThreadId) || undefined;
 
       // Wait for in-progress model load to finish before inferring
       if (runtime.modelLoading) {
@@ -430,6 +443,9 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
         }
       }
 
+      // Re-read store after potential auto-load / model ready wait
+      runtime = useChatRuntimeStore.getState();
+      const { params } = runtime;
       const {
         supportsTools,
         toolsEnabled,
@@ -461,14 +477,14 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
         }
         runtime.clearPendingAudio();
       }
-      const useAdapter = await resolveUseAdapter(unstable_threadId);
+      const useAdapter = await resolveUseAdapter(resolvedThreadId);
 
       // ── Audio model path (non-streaming) ─────────────────────
       const activeModel = runtime.models.find(
         (m) => m.id === params.checkpoint,
       );
       if (activeModel?.isAudio && !activeModel?.hasAudioInput) {
-        const threadKey = unstable_threadId || "__default";
+        const threadKey = resolvedThreadId || "__default";
         runtime.setThreadRunning(threadKey, true);
         try {
           yield {
@@ -515,7 +531,7 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
         return;
       }
 
-      const threadKey = unstable_threadId || "__default";
+      const threadKey = resolvedThreadId || "__default";
       let waitingFirstChunk = true;
       let firstTokenSettled = false;
       const streamStartTime = Date.now();
@@ -588,7 +604,7 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
                     const mins = useChatRuntimeStore.getState().toolCallTimeout;
                     return mins >= 9999 ? 9999 : mins * 60;
                   })(),
-                  session_id: unstable_threadId || undefined,
+                  session_id: resolvedThreadId,
                 }
               : {}),
           },
@@ -623,7 +639,25 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
                 toolCallParts[toolCallParts.length - 1]?.toolCallId || "";
               const idx = toolCallParts.findIndex((p) => p.toolCallId === id);
               if (idx !== -1) {
-                toolCallParts[idx] = { ...toolCallParts[idx], result: toolEvent.result as string };
+                const rawResult = (toolEvent.result as string) ?? "";
+                const imgMarker = "\n__IMAGES__:";
+                const imgIdx = rawResult.lastIndexOf(imgMarker);
+                let parsedResult: string | { text: string; images: string[]; sessionId: string };
+                if (imgIdx !== -1) {
+                  const text = rawResult.slice(0, imgIdx);
+                  // Fall back to "_default" to match the backend sandbox directory
+                  // used when no session_id is provided (see tools.py _get_workdir).
+                  const sessionId = resolvedThreadId || "_default";
+                  try {
+                    const images = JSON.parse(rawResult.slice(imgIdx + imgMarker.length)) as string[];
+                    parsedResult = { text, images, sessionId };
+                  } catch {
+                    parsedResult = rawResult;
+                  }
+                } else {
+                  parsedResult = rawResult;
+                }
+                toolCallParts[idx] = { ...toolCallParts[idx], result: parsedResult };
               }
             }
             // Yield cumulative state so tool UI updates (tools first, text after)

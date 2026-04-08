@@ -18,31 +18,6 @@ if _backend_dir not in sys.path:
 import _platform_compat  # noqa: F401
 
 
-def _bootstrap_studio_venv() -> None:
-    """Expose the Studio venv's site-packages to the current interpreter.
-
-    On Colab, notebook cells run outside the venv subshell. Instead of
-    installing the full stack into system Python, we prepend the venv's
-    site-packages so that packages like structlog, fastapi, etc. are
-    importable from notebook cells and take priority over system copies.
-    """
-    venv_lib = Path.home() / ".unsloth" / "studio" / ".venv" / "lib"
-    if not venv_lib.exists():
-        import warnings
-
-        warnings.warn(
-            f"Studio venv not found at {venv_lib.parent} -- run 'unsloth studio setup' first",
-            stacklevel = 2,
-        )
-        return
-    for sp in venv_lib.glob("python*/site-packages"):
-        sp_str = str(sp)
-        if sp_str not in sys.path:
-            sys.path.insert(0, sp_str)
-
-
-_bootstrap_studio_venv()
-
 from loggers import get_logger
 
 logger = get_logger(__name__)
@@ -91,7 +66,10 @@ def show_link(port: int = 8888):
             <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="white"><polygon points="5,3 19,12 5,21"/></svg>
             Open Unsloth Studio
         </a>
-        <p style="color: #333333; margin: 16px 0 0 0; font-size: 13px; font-family: monospace;">
+        <p style="color: #333333; margin: 12px 0 0 0; font-size: 14px; font-weight: bold;">
+            If the link doesn't work, you can scroll down to view the UI generated directly in Colab.
+        </p>
+        <p style="color: #333333; margin: 16px 0 0 0; font-size: 13px; font-family: monospace; font-weight: bold;">
             {short_url}
         </p>
     </div>

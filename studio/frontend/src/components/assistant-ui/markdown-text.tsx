@@ -4,19 +4,39 @@
 "use client";
 
 import { copyToClipboard } from "@/lib/copy-to-clipboard";
+import { preprocessLaTeX } from "@/lib/latex";
 import { INTERNAL, useMessagePartText } from "@assistant-ui/react";
 import { Copy02Icon, Tick02Icon } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { code } from "@streamdown/code";
-import { math } from "@streamdown/math";
+import { createMathPlugin } from "@streamdown/math";
 import { mermaid } from "@streamdown/mermaid";
 import { DownloadIcon, Maximize2Icon, Minimize2Icon } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Block, type BlockProps, Streamdown } from "streamdown";
 import "katex/dist/katex.min.css";
 import { AudioPlayer } from "./audio-player";
 
+const math = createMathPlugin({ singleDollarTextMath: true });
 const { withSmoothContextProvider } = INTERNAL;
+
+const STREAMDOWN_COMPONENTS = {
+  a: ({
+    href,
+    children,
+    ...props
+  }: React.ComponentProps<"a">) => (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="text-primary underline underline-offset-2 decoration-primary/40 hover:decoration-primary transition-colors"
+      {...props}
+    >
+      {children}
+    </a>
+  ),
+};
 const COPY_RESET_MS = 2000;
 const MERMAID_SOURCE_RE = /```mermaid\s*([\s\S]*?)```/i;
 const CODE_FENCE_RE = /^```([^\r\n`]*)\r?\n([\s\S]*?)\r?\n?```$/;
@@ -80,20 +100,27 @@ function getCodeFilename(language: string | null) {
 function isSvgFence(codeFence: CodeFence): boolean {
   const lang = codeFence.language?.toLowerCase() ?? "";
   if (lang === "svg") return true;
-  if ((lang === "xml" || lang === "html") && codeFence.source.trimStart().startsWith("<svg")) return true;
+  if (lang === "xml" || lang === "html") {
+    const trimmed = codeFence.source.trimStart();
+    // Match <svg directly or <?xml ...?> followed by <svg
+    if (trimmed.startsWith("<svg")) return true;
+    if (trimmed.startsWith("<?xml") && trimmed.includes("<svg")) return true;
+  }
   return false;
 }
 
 function isHtmlFence(codeFence: CodeFence): boolean {
   const lang = codeFence.language?.toLowerCase() ?? "";
-  return lang === "html" && !codeFence.source.trimStart().startsWith("<svg");
+  return lang === "html" && !isSvgFence(codeFence);
 }
 
 const UNSAFE_SVG_RE = /<script[\s>]|on\w+\s*=|javascript:|<foreignObject[\s>]|<iframe[\s>]|<embed[\s>]|<object[\s>]/i;
 
 function sanitizeSvg(source: string): string | null {
   if (UNSAFE_SVG_RE.test(source)) return null;
-  return source;
+  // Strip XML declaration (<?xml ...?>) -- not needed for data URI
+  // rendering and can cause issues with some renderers.
+  return source.replace(/^\s*<\?xml[^?]*\?>\s*/i, "");
 }
 
 function SvgPreview({ source }: { source: string }) {
@@ -375,6 +402,7 @@ const AUDIO_PLAYER_RE = /<audio-player\s+src="([^"]+)"\s*\/>/;
 
 const MarkdownTextImpl = () => {
   const { text, status } = useMessagePartText();
+  const processedText = useMemo(() => preprocessLaTeX(text), [text]);
 
   const audioMatch = text.match(AUDIO_PLAYER_RE);
   if (audioMatch) {
@@ -382,11 +410,12 @@ const MarkdownTextImpl = () => {
   }
 
   return (
-    <div data-status={status.type}>
+    <div data-status={status.type} className="min-w-0 max-w-full">
       <Streamdown
         mode="streaming"
         isAnimating={status.type === "running"}
         plugins={{ code, math, mermaid }}
+        components={STREAMDOWN_COMPONENTS}
         controls={{
           code: false,
           mermaid: {
@@ -399,7 +428,7 @@ const MarkdownTextImpl = () => {
         shikiTheme={["github-light", "github-dark"]}
         BlockComponent={StreamdownBlock}
       >
-        {text}
+        {processedText}
       </Streamdown>
     </div>
   );
