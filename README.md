@@ -231,3 +231,34 @@ This structure helps support ongoing Unsloth development while keeping the proje
 - The Pytorch and [Torch AO](https://github.com/unslothai/unsloth/pull/3391) team for their contributions
 - NVIDIA for their [NeMo DataDesigner](https://github.com/NVIDIA-NeMo/DataDesigner) library and their contributions
 - And of course for every single person who has contributed or has used Unsloth!
+
+---
+
+## iAiFy Fork Notes
+
+> This section is maintained by the iAiFy enterprise and documents what the AiFeatures fork actually supports. If this contradicts upstream text above, this section wins for iAiFy operators.
+
+**Status:** Active fork (maintained).
+**Enterprise:** iAiFy (Stockholm).
+**Upstream sync:** Managed via [Ai-road-4-You/fork-sync](https://github.com/Ai-road-4-You) — upstream changes are reviewed before merge; divergence is intentional where documented.
+**Support scope:** Only the build/run paths documented below are supported internally. Other upstream surfaces are best-effort.
+
+### Supported commands
+
+Run only the commands verified in this repo's current manifest (see `package.json` / `pyproject.toml` / `Cargo.toml` for the authoritative list).
+
+### CI/CD
+
+This repo uses (or is migrating to) the shared enterprise CI/CD:
+
+- Reusable workflows: [Ai-road-4-You/enterprise-ci-cd@v1](https://github.com/Ai-road-4-You/enterprise-ci-cd)
+- Governance: [Ai-road-4-You/governance](https://github.com/Ai-road-4-You/governance)
+- Documentation standard: [`docs/documentation-standard.md`](https://github.com/Ai-road-4-You/governance/blob/main/docs/documentation-standard.md)
+
+### Contributing
+
+Internal contributors follow the iAiFy governance rules: conventional commits, PR review required, no force-push to `main`. See [Ai-road-4-You/governance](https://github.com/Ai-road-4-You/governance).
+
+### License
+
+See `LICENSE` in this repo. iAiFy-originated changes are MIT unless the upstream license requires otherwise.
