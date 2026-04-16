@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__version__ = "2026.4.4"
+__version__ = "2026.4.5"
 
 __all__ = [
     "SUPPORTS_BFLOAT16",
@@ -45,6 +45,7 @@ __all__ = [
     # "accelerate_old_send_to_device",
     # "accelerate_new_send_to_device",
     "patch_gradient_accumulation_fix",
+    "apply_accepts_loss_kwargs_fix",
     "patch_compiling_bitsandbytes",
     "patch_regional_compilation",
     "patch_layernorm",
@@ -232,6 +233,8 @@ def apply_unsloth_gradient_checkpointing(
 # access on some GPU architectures (B200). Falls back to eager safely.
 _FLEX_EXCLUDED_MODELS = ("gpt_oss", "mllama", "nemotron_h", "modernbert")
 _EAGER_ONLY_PREFIXES = ("gemma3n",)
+_FLASH_ATTENTION_DISABLED_MODELS = ("gemma4", "gemma4_text")
+_FLASH_ATTENTION_DISABLED_WARNED = set()
 
 
 def _is_flex_excluded(model_type):
@@ -240,6 +243,61 @@ def _is_flex_excluded(model_type):
 
 def _is_eager_only(model_type):
     return any(model_type.startswith(p) for p in _EAGER_ONLY_PREFIXES)
+
+
+def _is_flash_attention_disabled(model_type):
+    return model_type in _FLASH_ATTENTION_DISABLED_MODELS
+
+
+def _is_flash_attention_requested(attn_implementation):
+    return isinstance(attn_implementation, str) and attn_implementation.startswith(
+        "flash_attention"
+    )
+
+
+def _disable_flash_attention_if_needed(
+    model_type,
+    config,
+    attn_implementation = None,
+    supports_sdpa = False,
+    would_use_flash_attention = False,
+):
+    if not _is_flash_attention_disabled(model_type):
+        return attn_implementation
+
+    requested_attn_implementation = attn_implementation
+    if requested_attn_implementation is None:
+        requested_attn_implementation = getattr(config, "_attn_implementation", None)
+    if requested_attn_implementation is None:
+        requested_attn_implementation = getattr(config, "attn_implementation", None)
+
+    if requested_attn_implementation == "eager":
+        return _set_attn_impl(config, "eager")
+
+    fallback_attn_implementation = "sdpa" if supports_sdpa else "eager"
+    if (
+        _is_flash_attention_requested(requested_attn_implementation)
+        or would_use_flash_attention
+    ):
+        logged_attn_implementation = (
+            requested_attn_implementation
+            if _is_flash_attention_requested(requested_attn_implementation)
+            else "flash_attention_2"
+        )
+        warning_key = (
+            model_type,
+            logged_attn_implementation,
+            fallback_attn_implementation,
+        )
+        if warning_key not in _FLASH_ATTENTION_DISABLED_WARNED:
+            _FLASH_ATTENTION_DISABLED_WARNED.add(warning_key)
+            print(
+                f"Unsloth: `{logged_attn_implementation}` is not supported "
+                "for Gemma 4 - "
+                f"defaulting to `{fallback_attn_implementation}`."
+            )
+
+    return _set_attn_impl(config, fallback_attn_implementation)
 
 
 def _set_attn_impl(config, impl):
@@ -258,6 +316,19 @@ def determine_attention_implementation(model_class, config):
     if _is_eager_only(model_type):
         _set_attn_impl(config, "eager")
         return "eager"
+
+    # Models with known Flash Attention incompatibilities. Gemma 4 full-attention
+    # layers use global_head_dim=512, which exceeds Flash Attention's dense
+    # head-dim support. Keep explicit eager requests, otherwise prefer SDPA.
+    if _is_flash_attention_disabled(model_type):
+        supports_sdpa = model_class is not None and getattr(
+            model_class, "_supports_sdpa", False
+        )
+        return _disable_flash_attention_if_needed(
+            model_type,
+            config,
+            supports_sdpa = supports_sdpa,
+        )
 
     # Flash Attention 2
     if HAS_FLASH_ATTENTION and model_class is not None:
@@ -1350,6 +1421,11 @@ import socket
 def has_internet(host = "8.8.8.8", port = 53, timeout = 3):
     if os.environ.get("TRANSFORMERS_OFFLINE", "0") == "1":
         return False
+
+    OFFLINE_TRUE = {"1", "true", "yes", "on"}
+
+    if os.environ.get("HF_HUB_OFFLINE", "").strip().lower() in OFFLINE_TRUE:
+        return False
     try:
         socket.setdefaulttimeout(timeout)
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1468,8 +1544,8 @@ def _get_statistics(statistics = None, force_download = True):
                     "```"
                 )
             except Exception:
-                # Try no time limit check
-                stats_check()
+                logger.debug("Unsloth: stats_check failed with an exception.")
+                # Don't retry without a time limit — would freeze offline
 
 
 def get_statistics(local_files_only = False):
@@ -2078,47 +2154,148 @@ def patch_gradient_accumulation_fix(Trainer):
         exec(function, globals())
         Trainer.training_step = _unsloth_training_step
 
-    # Prevent double scaling gradient accumulation
-    # https://github.com/huggingface/transformers/pull/37208
-    # Patch model_accepts_loss_kwargs detection in Trainer.__init__
-    if Trainer.__init__.__name__ != "_unsloth___init__":
+    # Wrap Trainer.__init__: (1) pre-init, shadow accepts_loss_kwargs on whatever
+    # model was passed in (covers PEFT wrapping done after FastModel.from_pretrained);
+    # (2) post-init, clamp accelerator GA to 1 for the transformers 5.0-5.5
+    # GradientAccumulationPlugin regression. No-op on 4.x and 5.6+. See #4982.
+    if not getattr(Trainer, "_unsloth_init_wrapped_for_accelerate_gas", False):
+        _original_trainer_init = Trainer.__init__
+
+        def _unsloth_trainer_init(self, *args, **kwargs):
+            model = kwargs.get("model")
+            if model is None and len(args) > 0:
+                model = args[0]
+            if model is not None:
+                try:
+                    apply_accepts_loss_kwargs_fix(model)
+                except Exception:
+                    pass
+            _original_trainer_init(self, *args, **kwargs)
+            try:
+                accelerator = getattr(self, "accelerator", None)
+                if (
+                    accelerator is not None
+                    and getattr(accelerator, "gradient_accumulation_steps", 1) > 1
+                ):
+                    accelerator.gradient_accumulation_steps = 1
+                    gs = getattr(accelerator, "gradient_state", None)
+                    if gs is not None and hasattr(gs, "plugin_kwargs"):
+                        try:
+                            gs.plugin_kwargs["num_steps"] = 1
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        _unsloth_trainer_init.__wrapped__ = _original_trainer_init
+        Trainer.__init__ = _unsloth_trainer_init
+        Trainer._unsloth_init_wrapped_for_accelerate_gas = True
+
+
+def _unsloth_compile_cache_leaves():
+    # Accepts `UNSLOTH_COMPILE_LOCATION` overrides (the env var unsloth_zoo honors).
+    leaves = {"unsloth_compiled_cache", "unsloth_cache", "unsloth_compiled"}
+    loc = os.environ.get("UNSLOTH_COMPILE_LOCATION", "") or ""
+    loc = loc.rstrip("/\\")
+    if loc:
+        leaves.add(os.path.basename(loc) or loc)
+    return leaves
+
+
+def _forward_is_unsloth_compiled(model):
+    # True iff forward was installed from the Unsloth compile cache directory.
+    # __module__ stays as the transformers module, so check co_filename.
+    leaves = _unsloth_compile_cache_leaves()
+
+    def check(m):
+        if m is None:
+            return False
+        fwd = getattr(type(m), "forward", None)
+        if fwd is None:
+            return False
+        code = getattr(fwd, "__code__", None)
+        fn = getattr(code, "co_filename", "") if code is not None else ""
+        fn = fn.replace("\\", "/")
+        parts = set(fn.split("/"))
+        return any(leaf in parts for leaf in leaves)
+
+    if check(model):
+        return True
+    seen = set()
+    m = model
+    for _ in range(4):
+        if m is None or id(m) in seen:
+            break
+        seen.add(id(m))
+        nxt = getattr(m, "base_model", None)
+        if nxt is None or nxt is m:
+            nxt = getattr(m, "model", None)
+        if nxt is None or nxt is m:
+            break
+        if check(nxt):
+            return True
+        m = nxt
+    return False
+
+
+def _find_concrete_accepts_loss_kwargs(model):
+    # Walk wrapper chain for first class that declares accepts_loss_kwargs in its
+    # own __mro__ dict. Avoids PEFT __getattr__ forwarding and our own shadow.
+    seen = set()
+    m = model
+    for _ in range(6):
+        if m is None or id(m) in seen:
+            break
+        seen.add(id(m))
+        for klass in type(m).__mro__:
+            if "accepts_loss_kwargs" in klass.__dict__:
+                return klass.__dict__[
+                    "accepts_loss_kwargs"
+                ], f"{klass.__name__}.accepts_loss_kwargs"
+        nxt = getattr(m, "base_model", None)
+        if nxt is None or nxt is m:
+            nxt = getattr(m, "model", None)
+        if nxt is None or nxt is m:
+            break
+        m = nxt
+    return None, "no explicit accepts_loss_kwargs on any wrapper level"
+
+
+def _shadow_accepts_loss_kwargs(model, value):
+    # Set the attribute at every wrapper level so HF's hasattr check resolves
+    # regardless of where accelerator / peft unwrap lands.
+    seen = set()
+    m = model
+    for _ in range(8):
+        if m is None or id(m) in seen:
+            break
+        seen.add(id(m))
         try:
-            init_function = inspect.getsource(Trainer.__init__)
+            setattr(m, "accepts_loss_kwargs", value)
         except Exception:
-            init_function = ""
-        if init_function is not None:
-            init_function = textwrap.dedent(init_function)
+            pass
+        nxt = getattr(m, "base_model", None)
+        if nxt is None or nxt is m:
+            nxt = getattr(m, "model", None)
+        if nxt is None or nxt is m:
+            break
+        m = nxt
 
-            # Import all variables that need importing
-            import transformers.trainer
 
-            items_in_trainer = dir(transformers.trainer)
-            good_items = []
-            for item in items_in_trainer:
-                if item in init_function:
-                    good_items.append(item)
-            exec(
-                "from transformers.trainer import ("
-                + ", ".join(x for x in good_items)
-                + ")",
-                globals(),
-            )
+def apply_accepts_loss_kwargs_fix(model):
+    # Shadow the correct accepts_loss_kwargs on the model so HF Trainer picks it
+    # up via hasattr(unwrapped_model, ...). Replaces the old Trainer.__init__
+    # source rewrite. Priority: compiled forward -> True; else first class attr
+    # in wrapper chain; else leave HF default. Issue #4982.
+    if _forward_is_unsloth_compiled(model):
+        _shadow_accepts_loss_kwargs(model, True)
+        return "True (Unsloth compiled forward)"
 
-            init_function = init_function.replace(
-                "def __init__", "def _unsloth___init__", 1
-            )
-
-            # Respect an inner wrapped model's explicit accepts_loss_kwargs flag before inferring from forward(**kwargs).
-            # https://github.com/unslothai/unsloth/issues/4982 Gemma4ForConditionalGeneration had issues with grad_acc
-            init_function = init_function.replace(
-                "self.model_accepts_loss_kwargs = unwrapped_model.accepts_loss_kwargs\n    else:",
-                "self.model_accepts_loss_kwargs = unwrapped_model.accepts_loss_kwargs\n"
-                '    elif hasattr(getattr(unwrapped_model, "model", None), "accepts_loss_kwargs"):\n'
-                "        self.model_accepts_loss_kwargs = unwrapped_model.model.accepts_loss_kwargs\n"
-                "    else:",
-            )
-            exec(init_function, globals())
-            Trainer.__init__ = _unsloth___init__
+    value, reason = _find_concrete_accepts_loss_kwargs(model)
+    if value is None:
+        return f"default (signature inspection, {reason})"
+    _shadow_accepts_loss_kwargs(model, value)
+    return f"{value} ({reason})"
 
 
 def patch_tokenizer(model, tokenizer):
@@ -2616,6 +2793,55 @@ def _prepare_model_for_qat(
                 granularity = PerAxis(0),
             )
             filter_fn = lambda m, _: isinstance(m, torch.nn.Linear)
+            torchao_config = TorchAOConfig(
+                qat_scheme = qat_scheme,
+                base_config_and_filter_fns = [(base_config, filter_fn)],
+            )
+        elif qat_scheme == "cactus":
+            try:
+                from torchao.quantization import IntxWeightOnlyConfig
+            except ImportError:
+                raise ImportError(TORCHAO_MSG)
+
+            # IntxWeightOnlyConfig already defaults to
+            # `mapping_type = MappingType.SYMMETRIC`, so we intentionally do not
+            # import `MappingType` here. Matches the upstream Cactus runtime
+            # int8 / per-group-32 / symmetric weight-only configuration.
+            group_size = 32
+            base_config = IntxWeightOnlyConfig(
+                weight_dtype = torch.int8,
+                granularity = PerGroup(group_size),
+            )
+            filter_fn = (
+                lambda m, _: isinstance(m, torch.nn.Linear)
+                and m.in_features >= group_size
+                and m.in_features % group_size == 0
+            )
+            # Warn if any Linear layer is skipped by the cactus filter because
+            # its in_features is not divisible by `group_size`. torchao's
+            # PerGroup(32) quantizer rejects non-divisible widths at
+            # `quantize_()` time, so the filter excludes those layers to keep
+            # the QAT prepare step from crashing. Surface that silently-skipped
+            # coverage gap to the user so they know some Linears will stay in
+            # full precision during training.
+            skipped_cactus_layers = [
+                name
+                for name, module in model.named_modules()
+                if isinstance(module, torch.nn.Linear)
+                and module.in_features >= group_size
+                and module.in_features % group_size != 0
+            ]
+            if skipped_cactus_layers:
+                preview = ", ".join(skipped_cactus_layers[:8])
+                if len(skipped_cactus_layers) > 8:
+                    preview += f", ... ({len(skipped_cactus_layers) - 8} more)"
+                warnings.warn(
+                    f"Unsloth: qat_scheme='cactus' uses PerGroup({group_size}) "
+                    "which requires in_features to be divisible by "
+                    f"{group_size}. The following Linear layers will be kept "
+                    f"in full precision during QAT: {preview}",
+                    stacklevel = 2,
+                )
             torchao_config = TorchAOConfig(
                 qat_scheme = qat_scheme,
                 base_config_and_filter_fns = [(base_config, filter_fn)],
