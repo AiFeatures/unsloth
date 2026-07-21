@@ -9,6 +9,7 @@ import { Suspense, lazy, useEffect, useRef, useState } from "react";
 import type { ConfettiRef } from "@/components/ui/confetti";
 import { STEPS } from "@/config/training";
 import { isOnboardingDone, markOnboardingDone } from "@/features/auth";
+import { prefersReducedMotion } from "@/features/settings";
 import { useTrainingConfigStore } from "@/features/training";
 import { SplashScreen } from "./splash-screen";
 import { WizardContent } from "./wizard-content";
@@ -52,20 +53,23 @@ export function WizardLayout() {
   useEffect(() => {
     if (isFinalStep && !hasFiredRef.current) {
       hasFiredRef.current = true;
-      confettiRef.current?.fire({
-        particleCount: 80,
-        angle: 60,
-        spread: 55,
-        origin: { x: 0, y: 0.6 },
-        colors: ["#34b482", "#26ccff", "#a25afd", "#88ff5a"],
-      });
-      confettiRef.current?.fire({
-        particleCount: 80,
-        angle: 120,
-        spread: 55,
-        origin: { x: 1, y: 0.6 },
-        colors: ["#34b482", "#26ccff", "#a25afd", "#88ff5a"],
-      });
+      // Honor Appearance > Reduce motion; skip the celebration when reduced.
+      if (!prefersReducedMotion()) {
+        confettiRef.current?.fire({
+          particleCount: 80,
+          angle: 60,
+          spread: 55,
+          origin: { x: 0, y: 0.6 },
+          colors: ["#34b482", "#26ccff", "#a25afd", "#88ff5a"],
+        });
+        confettiRef.current?.fire({
+          particleCount: 80,
+          angle: 120,
+          spread: 55,
+          origin: { x: 1, y: 0.6 },
+          colors: ["#34b482", "#26ccff", "#a25afd", "#88ff5a"],
+        });
+      }
     }
     if (!isFinalStep) {
       hasFiredRef.current = false;
@@ -73,7 +77,7 @@ export function WizardLayout() {
   }, [isFinalStep]);
 
   return (
-    <div className="relative min-h-screen flex items-center justify-center overflow-hidden bg-gradient-to-br from-primary/5 via-background to-primary/3 p-4 sm:p-6 md:p-8">
+    <div className="relative flex min-h-[calc(100dvh-var(--studio-titlebar-height,0px))] items-center justify-center overflow-hidden bg-gradient-to-br from-primary/5 via-background to-primary/3 p-4 sm:p-6 md:p-8">
       {showSplash && (
         <SplashScreen
           onStartOnboarding={() => setShowSplash(false)}

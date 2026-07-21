@@ -1,129 +1,307 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+  type PlusMenuItemId,
+  useChatPreferencesStore,
+  useChatRuntimeStore,
+  usePlusMenuPrefsStore,
+} from "@/features/chat";
+import { useT } from "@/i18n";
 import {
-  clearAllChats,
-  countAllChats,
-} from "@/features/chat/utils/clear-all-chats";
-import { downloadChatExport } from "@/features/chat/utils/export-chat-history";
-import { Delete02Icon, Download02Icon } from "@hugeicons/core-free-icons";
+  Bookmark02Icon,
+  Download01Icon,
+  FileDatabaseIcon,
+  Folder01Icon,
+  McpServerIcon,
+  PencilRulerIcon,
+  ShieldBanIcon,
+} from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
-import { useEffect, useState } from "react";
+import { Columns2Icon, PlusIcon } from "lucide-react";
+import { useEffect } from "react";
+import type { ReactNode } from "react";
 import { SettingsRow } from "../components/settings-row";
-import { SettingsSection } from "../components/settings-section";
+import {
+  SettingsGroupDivider,
+  SettingsSection,
+} from "../components/settings-section";
+
+// Adjustable "+" menu items shown in settings, in display order. Icons mirror
+// the ones used in the composer + menu itself.
+const PLUS_MENU_ICON_CLASS = "size-[18px]";
+const PLUS_MENU_SETTINGS: {
+  id: PlusMenuItemId;
+  label: string;
+  icon: ReactNode;
+}[] = [
+  {
+    id: "chatWithFiles",
+    label: "Chat with Files (RAG)",
+    icon: (
+      <HugeiconsIcon
+        icon={FileDatabaseIcon}
+        strokeWidth={2}
+        className={PLUS_MENU_ICON_CLASS}
+      />
+    ),
+  },
+  {
+    id: "mcp",
+    label: "MCP",
+    icon: (
+      <HugeiconsIcon
+        icon={McpServerIcon}
+        strokeWidth={2}
+        className={PLUS_MENU_ICON_CLASS}
+      />
+    ),
+  },
+  {
+    id: "savedPrompts",
+    label: "Saved prompts",
+    icon: (
+      <HugeiconsIcon
+        icon={Bookmark02Icon}
+        strokeWidth={2}
+        className={PLUS_MENU_ICON_CLASS}
+      />
+    ),
+  },
+  {
+    id: "compareChat",
+    label: "Compare chat",
+    icon: <Columns2Icon className={PLUS_MENU_ICON_CLASS} />,
+  },
+  {
+    id: "exportChat",
+    label: "Export chat",
+    icon: (
+      <HugeiconsIcon
+        icon={Download01Icon}
+        strokeWidth={2}
+        className={PLUS_MENU_ICON_CLASS}
+      />
+    ),
+  },
+  {
+    id: "canvas",
+    label: "Canvas",
+    icon: (
+      <HugeiconsIcon
+        icon={PencilRulerIcon}
+        strokeWidth={2}
+        className={PLUS_MENU_ICON_CLASS}
+      />
+    ),
+  },
+  {
+    id: "projects",
+    label: "Projects",
+    icon: (
+      <HugeiconsIcon
+        icon={Folder01Icon}
+        strokeWidth={2}
+        className={PLUS_MENU_ICON_CLASS}
+      />
+    ),
+  },
+  {
+    id: "bypassPermissions",
+    label: "Tool permissions",
+    icon: (
+      <HugeiconsIcon
+        icon={ShieldBanIcon}
+        strokeWidth={2}
+        className={PLUS_MENU_ICON_CLASS}
+      />
+    ),
+  },
+];
 
 export function ChatTab() {
-  const [confirmOpen, setConfirmOpen] = useState(false);
-  const [count, setCount] = useState<number | null>(null);
-  const [exporting, setExporting] = useState(false);
-  const [clearing, setClearing] = useState(false);
+  const t = useT();
+  const plusPins = usePlusMenuPrefsStore((state) => state.pins);
+  const togglePlusPin = usePlusMenuPrefsStore((state) => state.togglePin);
+  const autoTitle = useChatRuntimeStore((state) => state.autoTitle);
+  const setAutoTitle = useChatRuntimeStore((state) => state.setAutoTitle);
+  const showCanvasMenuItem = useChatRuntimeStore(
+    (state) => state.showCanvasMenuItem,
+  );
+  const setShowCanvasMenuItem = useChatRuntimeStore(
+    (state) => state.setShowCanvasMenuItem,
+  );
+  const collapseHtmlArtifacts = useChatRuntimeStore(
+    (state) => state.collapseHtmlArtifacts,
+  );
+  const setCollapseHtmlArtifacts = useChatRuntimeStore(
+    (state) => state.setCollapseHtmlArtifacts,
+  );
+  const allowArtifactNetworkAccess = useChatRuntimeStore(
+    (state) => state.allowArtifactNetworkAccess,
+  );
+  const setAllowArtifactNetworkAccess = useChatRuntimeStore(
+    (state) => state.setAllowArtifactNetworkAccess,
+  );
+  const hydratePersistedSettings = useChatRuntimeStore(
+    (state) => state.hydratePersistedSettings,
+  );
+  const expandQuantizations = useChatRuntimeStore(
+    (state) => state.expandQuantizations,
+  );
+  const setExpandQuantizations = useChatRuntimeStore(
+    (state) => state.setExpandQuantizations,
+  );
+  const showAllQuantizations = useChatRuntimeStore(
+    (state) => state.showAllQuantizations,
+  );
+  const setShowAllQuantizations = useChatRuntimeStore(
+    (state) => state.setShowAllQuantizations,
+  );
+  const showModelDisclaimer = useChatPreferencesStore(
+    (state) => state.showModelDisclaimer,
+  );
+  const setShowModelDisclaimer = useChatPreferencesStore(
+    (state) => state.setShowModelDisclaimer,
+  );
+  const showResponseModel = useChatPreferencesStore(
+    (state) => state.showResponseModel,
+  );
+  const setShowResponseModel = useChatPreferencesStore(
+    (state) => state.setShowResponseModel,
+  );
 
   useEffect(() => {
-    void countAllChats().then(setCount);
-  }, []);
-
-  const handleExport = async () => {
-    setExporting(true);
-    try {
-      await downloadChatExport();
-    } finally {
-      setExporting(false);
-    }
-  };
-
-  const handleClear = async () => {
-    setClearing(true);
-    try {
-      await clearAllChats();
-      setCount(0);
-      setConfirmOpen(false);
-    } finally {
-      setClearing(false);
-    }
-  };
+    void hydratePersistedSettings();
+  }, [hydratePersistedSettings]);
 
   return (
     <div className="flex flex-col gap-6">
       <header className="flex flex-col gap-1">
-        <h1 className="text-lg font-semibold font-heading">Chat</h1>
+        <h1 className="text-xl font-semibold font-heading">
+          {t("settings.chat.title")}
+        </h1>
         <p className="text-xs text-muted-foreground">
-          Manage your chat history stored on this device.
+          {t("settings.chat.description")}
         </p>
       </header>
 
-      <SettingsSection title="Data">
+      <SettingsSection title="Select model settings">
         <SettingsRow
-          label="Export chat history"
-          description="Download all chats and messages as a JSON file."
-        >
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handleExport}
-            disabled={exporting || count === 0}
-          >
-            <HugeiconsIcon icon={Download02Icon} className="size-3.5 mr-1.5" />
-            {exporting ? "Exporting…" : "Export"}
-          </Button>
-        </SettingsRow>
-
-        <SettingsRow
-          destructive
-          label="Clear all chats"
+          label="Expand quantizations"
           description={
-            count === null
-              ? "Permanently delete every chat on this device."
-              : count === 0
-                ? "No chats to clear."
-                : `Permanently delete all ${count} chat${count === 1 ? "" : "s"} on this device.`
+            <span>
+              On: On Device GGUF models show their quantizations right away.
+              <br />
+              Off: click a model to view its quantizations.
+            </span>
           }
         >
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setConfirmOpen(true)}
-            disabled={count === 0}
-            className="text-destructive hover:text-destructive hover:border-destructive/60"
-          >
-            <HugeiconsIcon icon={Delete02Icon} className="size-3.5 mr-1.5" />
-            Clear chats
-          </Button>
+          <Switch
+            checked={expandQuantizations}
+            onCheckedChange={setExpandQuantizations}
+          />
+        </SettingsRow>
+        <SettingsRow
+          label="Show all quantizations"
+          description={
+            <span>
+              On: list every On Device quantization, including not downloaded.
+              <br />
+              Off: show only downloaded quantizations.
+            </span>
+          }
+        >
+          <Switch
+            checked={showAllQuantizations}
+            onCheckedChange={setShowAllQuantizations}
+          />
         </SettingsRow>
       </SettingsSection>
 
-      <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
-        <DialogContent className="max-w-md">
-          <DialogHeader>
-            <DialogTitle>
-              Clear {count ?? 0} chat{count === 1 ? "" : "s"}?
-            </DialogTitle>
-            <DialogDescription>
-              This permanently deletes every chat and message stored on this device. This cannot be undone.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setConfirmOpen(false)}>
-              Cancel
-            </Button>
-            <Button
-              onClick={handleClear}
-              disabled={clearing}
-              className="bg-destructive hover:bg-destructive/90 text-destructive-foreground"
-            >
-              {clearing ? "Clearing…" : `Clear ${count ?? 0} chat${count === 1 ? "" : "s"}`}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <SettingsSection
+        title="Chat menu"
+        description={
+          <>
+            Pin items to chat's{" "}
+            <PlusIcon
+              aria-label="+"
+              className="inline size-3.5 align-[-2px] stroke-[2px]"
+            />{" "}
+            side menu. Others move into “More”.
+          </>
+        }
+      >
+        {PLUS_MENU_SETTINGS.map((item) => (
+          <SettingsRow key={item.id} label={item.label} icon={item.icon}>
+            {/* Canvas toggles menu visibility; the rest toggle pin placement. */}
+            <Switch
+              checked={
+                item.id === "canvas" ? showCanvasMenuItem : plusPins[item.id]
+              }
+              onCheckedChange={
+                item.id === "canvas"
+                  ? setShowCanvasMenuItem
+                  : () => togglePlusPin(item.id)
+              }
+            />
+          </SettingsRow>
+        ))}
+        <SettingsGroupDivider />
+        <SettingsRow
+          label={t("settings.chat.modelDisclaimer")}
+          description={t("settings.chat.modelDisclaimerDescription")}
+        >
+          <Switch
+            checked={showModelDisclaimer}
+            onCheckedChange={setShowModelDisclaimer}
+          />
+        </SettingsRow>
+        <SettingsRow
+          label="Show response model"
+          description="Show model metadata in assistant responses."
+        >
+          <Switch
+            checked={showResponseModel}
+            onCheckedChange={setShowResponseModel}
+          />
+        </SettingsRow>
+      </SettingsSection>
+
+      <SettingsSection title={t("settings.general.chatDefaults")}>
+        <SettingsRow
+          label={t("settings.general.autoTitleNewChats")}
+          description={t("settings.general.autoTitleNewChatsDescription")}
+        >
+          <Switch checked={autoTitle} onCheckedChange={setAutoTitle} />
+        </SettingsRow>
+      </SettingsSection>
+
+      <SettingsSection title={t("settings.chat.artifacts.title")}>
+        <SettingsRow
+          label={t("settings.chat.artifacts.collapseHtmlBlocks")}
+          description={t(
+            "settings.chat.artifacts.collapseHtmlBlocksDescription",
+          )}
+        >
+          <Switch
+            checked={collapseHtmlArtifacts}
+            onCheckedChange={setCollapseHtmlArtifacts}
+          />
+        </SettingsRow>
+        <SettingsRow
+          label={t("settings.chat.artifacts.allowNetworkAccess")}
+          description={t(
+            "settings.chat.artifacts.allowNetworkAccessDescription",
+          )}
+        >
+          <Switch
+            checked={allowArtifactNetworkAccess}
+            onCheckedChange={setAllowArtifactNetworkAccess}
+          />
+        </SettingsRow>
+      </SettingsSection>
     </div>
   );
 }

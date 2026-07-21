@@ -2,8 +2,11 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { ShimmerButton } from "@/components/ui/shimmer-button";
+import { Spinner } from "@/components/ui/spinner";
 import type { BackendStatus } from "@/hooks/use-tauri-backend";
+import type { CopySupportDiagnosticsResult } from "@/lib/tauri-diagnostics";
 import { AnimatePresence, motion } from "motion/react";
+import { useState } from "react";
 
 interface StartupScreenProps {
   status: BackendStatus;
@@ -17,6 +20,63 @@ interface StartupScreenProps {
   onRetryInstall: () => void;
   onApproveElevation: () => void;
   onStartServer: () => void;
+  onCopyDiagnostics: () => Promise<CopySupportDiagnosticsResult>;
+}
+
+function DiagnosticsCopyActions({
+  onCopyDiagnostics,
+  children,
+}: {
+  onCopyDiagnostics: () => Promise<CopySupportDiagnosticsResult>;
+  children: React.ReactNode;
+}) {
+  const [copying, setCopying] = useState(false);
+  const [manualReport, setManualReport] = useState<string | null>(null);
+  const [manualMessage, setManualMessage] = useState<string | null>(null);
+
+  async function handleCopyDiagnostics() {
+    setCopying(true);
+    try {
+      const result = await onCopyDiagnostics();
+      if (result.ok) {
+        setManualReport(null);
+        setManualMessage(null);
+      } else {
+        setManualReport(result.report);
+        setManualMessage(result.error ?? "Clipboard copy failed. Select and copy the diagnostics below.");
+      }
+    } catch (error) {
+      setManualReport(null);
+      setManualMessage(`Diagnostics copy failed: ${String(error)}`);
+    } finally {
+      setCopying(false);
+    }
+  }
+
+  return (
+    <div className="mt-4 flex w-full flex-col items-center gap-3">
+      <div className="flex gap-3">
+        <ActionButton
+          variant="secondary"
+          onClick={() => void handleCopyDiagnostics()}
+        >
+          {copying ? "Copying..." : "Copy Diagnostics"}
+        </ActionButton>
+        {children}
+      </div>
+      {manualMessage && (
+        <p className="max-w-md text-center text-xs text-destructive">{manualMessage}</p>
+      )}
+      {manualReport && (
+        <textarea
+          readOnly
+          value={manualReport}
+          onFocus={(event) => event.currentTarget.select()}
+          className="h-32 w-full max-w-md resize-none rounded-lg border border-border/50 bg-muted/30 p-2 font-mono text-[10px] text-muted-foreground"
+        />
+      )}
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -38,15 +98,6 @@ const EASE_OUT_QUART: [number, number, number, number] = [0.165, 0.84, 0.44, 1];
 // ---------------------------------------------------------------------------
 // Sub-components
 // ---------------------------------------------------------------------------
-
-function TealSpinner({ size = 24 }: { size?: number }) {
-  return (
-    <span
-      className="inline-block animate-spin rounded-full border-2 border-primary border-t-transparent"
-      style={{ width: size, height: size, animationDuration: "0.8s" }}
-    />
-  );
-}
 
 function Logo() {
   return (
@@ -89,7 +140,7 @@ function CheckingContent() {
         <Logo />
       </div>
       <div className="mb-10 flex flex-col items-center gap-2">
-        <TealSpinner />
+        <Spinner className="size-6 text-primary" />
         <p className="text-sm text-muted-foreground">Checking...</p>
       </div>
     </div>
@@ -135,7 +186,7 @@ function InstallingContent({
         <Logo />
       </div>
       <div className="mb-10 flex flex-col items-center gap-2">
-        <TealSpinner />
+        <Spinner className="size-6 text-primary" />
         <p className="text-sm font-bold text-foreground">Installing...</p>
         <p className="text-sm font-bold text-muted-foreground">
           Please wait a few mins, then you can start training.
@@ -168,8 +219,8 @@ function RepairingContent({
         <Logo />
       </div>
       <div className="mb-10 flex flex-col items-center gap-2">
-        <TealSpinner />
-        <p className="text-sm font-bold text-foreground">Updating existing Studio install...</p>
+        <Spinner className="size-6 text-primary" />
+        <p className="text-sm font-bold text-foreground">Updating existing Unsloth install...</p>
         {latest && (
           <p className="max-w-xs text-center text-xs text-muted-foreground">{latest}</p>
         )}
@@ -180,12 +231,12 @@ function RepairingContent({
 
 function InstallErrorContent({
   error,
-  logs,
   onRetryInstall,
+  onCopyDiagnostics,
 }: {
   error: string | null;
-  logs: string[];
   onRetryInstall: () => void;
+  onCopyDiagnostics: () => Promise<CopySupportDiagnosticsResult>;
 }) {
   return (
     <>
@@ -195,15 +246,9 @@ function InstallErrorContent({
         {error && (
           <p className="max-w-xs text-center text-xs text-muted-foreground">{error}</p>
         )}
-        <div className="mt-4 flex gap-3">
-          <ActionButton
-            variant="secondary"
-            onClick={() => void navigator.clipboard.writeText(logs.join("\n"))}
-          >
-            Copy Logs
-          </ActionButton>
+        <DiagnosticsCopyActions onCopyDiagnostics={onCopyDiagnostics}>
           <ActionButton onClick={onRetryInstall}>Try Again</ActionButton>
-        </div>
+        </DiagnosticsCopyActions>
       </div>
     </>
   );
@@ -211,12 +256,12 @@ function InstallErrorContent({
 
 function RepairErrorContent({
   error,
-  logs,
   onRetry,
+  onCopyDiagnostics,
 }: {
   error: string | null;
-  logs: string[];
   onRetry: () => void;
+  onCopyDiagnostics: () => Promise<CopySupportDiagnosticsResult>;
 }) {
   return (
     <>
@@ -226,15 +271,9 @@ function RepairErrorContent({
         {error && (
           <p className="max-w-md text-center text-xs text-muted-foreground">{error}</p>
         )}
-        <div className="mt-4 flex gap-3">
-          <ActionButton
-            variant="secondary"
-            onClick={() => void navigator.clipboard.writeText(logs.join("\n"))}
-          >
-            Copy Logs
-          </ActionButton>
+        <DiagnosticsCopyActions onCopyDiagnostics={onCopyDiagnostics}>
           <ActionButton onClick={onRetry}>Retry</ActionButton>
-        </div>
+        </DiagnosticsCopyActions>
       </div>
     </>
   );
@@ -278,7 +317,7 @@ function StartingContent() {
         <Logo />
       </div>
       <div className="mb-10 flex flex-col items-center gap-2">
-        <TealSpinner />
+        <Spinner className="size-6 text-primary" />
         <p className="text-sm text-muted-foreground">Starting server...</p>
       </div>
     </div>
@@ -301,12 +340,12 @@ function StoppedContent({ onStartServer }: { onStartServer: () => void }) {
 
 function ErrorContent({
   error,
-  logs,
   onRetry,
+  onCopyDiagnostics,
 }: {
   error: string | null;
-  logs: string[];
   onRetry: () => void;
+  onCopyDiagnostics: () => Promise<CopySupportDiagnosticsResult>;
 }) {
   return (
     <>
@@ -316,15 +355,9 @@ function ErrorContent({
         {error && (
           <p className="max-w-md text-center text-xs text-muted-foreground">{error}</p>
         )}
-        <div className="mt-4 flex gap-3">
-          <ActionButton
-            variant="secondary"
-            onClick={() => void navigator.clipboard.writeText(logs.join("\n"))}
-          >
-            Copy Logs
-          </ActionButton>
+        <DiagnosticsCopyActions onCopyDiagnostics={onCopyDiagnostics}>
           <ActionButton onClick={onRetry}>Retry</ActionButton>
-        </div>
+        </DiagnosticsCopyActions>
       </div>
     </>
   );
@@ -346,6 +379,7 @@ export function StartupScreen({
   onRetryInstall,
   onApproveElevation,
   onStartServer,
+  onCopyDiagnostics,
 }: StartupScreenProps) {
   function renderContent() {
     switch (status) {
@@ -356,11 +390,23 @@ export function StartupScreen({
       case "installing":
         return <InstallingContent currentStepIndex={currentStepIndex} progressDetail={progressDetail} />;
       case "install-error":
-        return <InstallErrorContent error={error} logs={logs} onRetryInstall={onRetryInstall} />;
+        return (
+          <InstallErrorContent
+            error={error}
+            onRetryInstall={onRetryInstall}
+            onCopyDiagnostics={onCopyDiagnostics}
+          />
+        );
       case "repairing":
         return <RepairingContent logs={logs} progressDetail={progressDetail} />;
       case "repair-error":
-        return <RepairErrorContent error={error} logs={logs} onRetry={onRetry} />;
+        return (
+          <RepairErrorContent
+            error={error}
+            onRetry={onRetry}
+            onCopyDiagnostics={onCopyDiagnostics}
+          />
+        );
       case "needs-elevation":
         return (
           <NeedsElevationContent
@@ -376,17 +422,23 @@ export function StartupScreen({
       case "stopped":
         return <StoppedContent onStartServer={onStartServer} />;
       case "error":
-        return <ErrorContent error={error} logs={logs} onRetry={onRetry} />;
+        return (
+          <ErrorContent
+            error={error}
+            onRetry={onRetry}
+            onCopyDiagnostics={onCopyDiagnostics}
+          />
+        );
     }
   }
 
   return (
-    <div className="flex h-screen w-full flex-col items-center bg-background">
-      <div className="flex flex-1 w-full max-w-md items-center justify-center px-6">
+    <div className="box-border flex h-full w-full flex-col items-center overflow-y-auto bg-background pb-6 pt-[var(--studio-startup-top-inset,0px)]">
+      <div className="flex min-h-0 flex-1 w-full max-w-md items-center justify-center px-6">
         <AnimatePresence mode="wait">
           <motion.div
             key={status}
-            className="flex h-full w-full flex-col items-center text-center"
+            className="flex h-full w-full flex-col items-center justify-center text-center"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}

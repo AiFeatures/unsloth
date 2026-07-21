@@ -1,8 +1,16 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod app_layout;
 mod commands;
 mod desktop_auth;
+mod desktop_backend_owner;
+mod desktop_update_policy;
+mod diagnostics;
 mod install;
+mod native_backend_lease;
+mod native_file_dialogs;
+mod native_intents;
+mod native_path_policy;
 mod preflight;
 mod process;
 mod update;
@@ -17,6 +25,15 @@ use std::fs;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager};
+use tauri_plugin_window_state::{AppHandleExt, StateFlags};
+
+#[tauri::command]
+fn has_saved_window_state(app: tauri::AppHandle) -> bool {
+    let Ok(dir) = app.path().app_config_dir() else {
+        return false;
+    };
+    dir.join(app.filename()).is_file()
+}
 
 fn setup_logging() {
     let mut loggers: Vec<Box<dyn SharedLogger>> = vec![];
@@ -58,8 +75,41 @@ fn setup_logging() {
     }
 }
 
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn setup_custom_titlebar(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let window = app.get_webview_window("main").ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "main window not found")
+    })?;
+    window.set_decorations(false)?;
+    Ok(())
+}
+
+fn cleanup_child_processes(app: &tauri::AppHandle) {
+    let diagnostics_state = app
+        .try_state::<diagnostics::DiagnosticsState>()
+        .map(|state| state.inner().clone());
+    if let Some(install_state) = app.try_state::<install::InstallState>() {
+        if let Some(diagnostics) = diagnostics_state.as_ref() {
+            install::record_install_intentional_stop(&install_state, diagnostics);
+        }
+        let _ = install::stop_install(&install_state);
+    }
+    if let Some(update_state) = app.try_state::<update::UpdateState>() {
+        if let Some(diagnostics) = diagnostics_state.as_ref() {
+            update::record_update_intentional_stop(&update_state, diagnostics);
+        }
+        let _ = update::stop_update(&update_state);
+    }
+    if let Some(backend_state) = app.try_state::<process::BackendState>() {
+        let shutdown = app
+            .try_state::<process::ShutdownFlag>()
+            .expect("ShutdownFlag must be managed");
+        let _ = process::stop_backend(&backend_state, &shutdown, diagnostics_state.as_ref());
+    }
+}
+
 fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    let open = MenuItemBuilder::with_id("open", "Open Studio").build(app)?;
+    let open = MenuItemBuilder::with_id("open", "Open Unsloth").build(app)?;
     let toggle = MenuItemBuilder::with_id("toggle", "Start/Stop Server").build(app)?;
     let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
     let menu = MenuBuilder::new(app)
@@ -81,17 +131,15 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = app.emit("tray-toggle-server", ());
             }
             "quit" => {
-                let install_state = app.state::<crate::install::InstallState>();
-                let _ = crate::install::stop_install(&install_state);
-                let update_state = app.state::<crate::update::UpdateState>();
-                let _ = crate::update::stop_update(&update_state);
-                // Detach the 5s graceful-wait so the tray click does not
-                // block the Tauri main loop. Exit runs the RunEvent::Exit
-                // safety net which also calls stop_backend synchronously.
-                let shutdown = app.state::<crate::process::ShutdownFlag>().inner().clone();
-                let backend_state = app.state::<crate::process::BackendState>().inner().clone();
-                crate::process::stop_backend_detached(backend_state, shutdown);
-                app.exit(0);
+                // Run cleanup off the menu callback, but only exit after the
+                // backend tree has been reaped. Exiting first can terminate this
+                // process while a detached cleanup thread is still waiting,
+                // leaving the backend orphaned.
+                let app_handle = app.clone();
+                std::thread::spawn(move || {
+                    cleanup_child_processes(&app_handle);
+                    app_handle.exit(0);
+                });
             }
             _ => {}
         })
@@ -132,12 +180,26 @@ fn main() {
         }))
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(
+            tauri_plugin_window_state::Builder::new()
+                .with_state_flags(StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED)
+                .skip_initial_state("main")
+                .build(),
+        )
+        .manage(diagnostics::new_diagnostics_state())
         .manage(install::new_install_state())
+        .manage(native_intents::new_native_intake_state())
         .manage(new_backend_state())
         .manage(process::new_shutdown_flag())
         .manage(update::new_update_state())
         .invoke_handler(tauri::generate_handler![
+            app_layout::has_initialized_app_window_layout,
+            app_layout::mark_app_window_layout_initialized,
+            app_layout::reset_app_window_layout_initialized,
             commands::check_install_status,
             commands::desktop_preflight,
             commands::start_install,
@@ -147,12 +209,29 @@ fn main() {
             commands::check_health,
             commands::get_server_logs,
             commands::open_logs_dir,
+            commands::open_models_dir,
             commands::start_backend_update,
             commands::start_managed_repair,
+            commands::cancel_pending_elevation,
             commands::install_system_packages,
             desktop_auth::desktop_auth,
+            desktop_update_policy::check_desktop_manual_update,
+            desktop_update_policy::desktop_update_policy,
+            diagnostics::collect_support_diagnostics,
+            native_file_dialogs::save_native_file,
+            native_file_dialogs::pick_native_chat_import,
+            native_intents::drain_native_intents,
+            native_intents::register_native_model_path,
+            native_intents::pick_native_model,
+            native_intents::consume_native_path_token,
+            native_intents::register_artifact_path,
+            native_intents::reveal_path_token,
+            native_intents::open_path_token,
+            has_saved_window_state,
         ])
         .setup(|app| {
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            setup_custom_titlebar(app)?;
             setup_tray(app)?;
             Ok(())
         })
@@ -172,18 +251,7 @@ fn main() {
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
                 // Cleanup on ALL exit paths — safety net for non-tray exits
-                if let Some(install_state) = app.try_state::<install::InstallState>() {
-                    let _ = install::stop_install(&install_state);
-                }
-                if let Some(update_state) = app.try_state::<update::UpdateState>() {
-                    let _ = update::stop_update(&update_state);
-                }
-                if let Some(backend_state) = app.try_state::<process::BackendState>() {
-                    let shutdown = app
-                        .try_state::<process::ShutdownFlag>()
-                        .expect("ShutdownFlag must be managed");
-                    let _ = process::stop_backend(&backend_state, &shutdown);
-                }
+                cleanup_child_processes(app);
             }
         });
 }
