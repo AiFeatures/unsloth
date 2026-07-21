@@ -9,7 +9,7 @@ import {
   hasRefreshToken,
   mustChangePassword,
   refreshSession,
-  tauriAutoAuth,
+  setMustChangePassword,
 } from "@/features/auth";
 
 async function hasActiveSession(): Promise<boolean> {
@@ -23,14 +23,47 @@ interface AuthStatus {
   requires_password_change: boolean;
 }
 
+const AUTH_STATUS_TTL_MS = 30_000;
+let authStatusCheckedAt = 0;
+let authStatusRequest: Promise<AuthStatus> | null = null;
+
+function hasFreshAuthStatus(): boolean {
+  return (
+    authStatusCheckedAt !== 0 &&
+    Date.now() - authStatusCheckedAt < AUTH_STATUS_TTL_MS
+  );
+}
+
 async function fetchAuthStatus(): Promise<AuthStatus> {
-  try {
-    const res = await fetch(apiUrl("/api/auth/status"));
-    if (!res.ok) return { initialized: true, requires_password_change: mustChangePassword() };
-    return (await res.json()) as AuthStatus;
-  } catch {
-    return { initialized: true, requires_password_change: mustChangePassword() };
-  }
+  if (authStatusRequest) return authStatusRequest;
+
+  const request = (async () => {
+    try {
+      const res = await fetch(apiUrl("/api/auth/status"));
+      if (!res.ok) {
+        return {
+          initialized: true,
+          requires_password_change: mustChangePassword(),
+        };
+      }
+      const status = (await res.json()) as AuthStatus;
+      authStatusCheckedAt = Date.now();
+      // Server truth wins; keep localStorage in sync both ways.
+      if (status.requires_password_change !== mustChangePassword()) {
+        setMustChangePassword(status.requires_password_change);
+      }
+      return status;
+    } catch {
+      return {
+        initialized: true,
+        requires_password_change: mustChangePassword(),
+      };
+    }
+  })().finally(() => {
+    authStatusRequest = null;
+  });
+  authStatusRequest = request;
+  return request;
 }
 
 function authRedirect(to: "/login" | "/change-password"): never {
@@ -39,17 +72,22 @@ function authRedirect(to: "/login" | "/change-password"): never {
 
 export async function requireAuth(): Promise<void> {
   if (isTauri) {
-    await tauriAutoAuth();
+    // AppProvider owns backend startup + desktop auth; route guards run before it mounts.
     return;
   }
 
   if (await hasActiveSession()) {
-    const { requires_password_change } = await fetchAuthStatus();
-    if (requires_password_change || mustChangePassword()) {
-      authRedirect("/change-password");
+    // Reconcile periodically so local-only routes cannot outlive a server-side
+    // password-change requirement, while nearby route switches stay local.
+    if (mustChangePassword() || !hasFreshAuthStatus()) {
+      const { requires_password_change } = await fetchAuthStatus();
+      if (requires_password_change || mustChangePassword()) {
+        authRedirect("/change-password");
+      }
     }
     return;
   }
+
   const status = await fetchAuthStatus();
   if (status.requires_password_change || mustChangePassword()) {
     authRedirect("/change-password");
@@ -59,16 +97,16 @@ export async function requireAuth(): Promise<void> {
 
 export async function requireGuest(): Promise<void> {
   if (isTauri) {
-    await tauriAutoAuth();
     throw redirect({ to: "/chat" });
   }
   if (!(await hasActiveSession())) return;
+  // Reconcile localStorage before routing.
+  await fetchAuthStatus();
   throw redirect({ to: getPostAuthRoute() });
 }
 
 export async function requirePasswordChangeFlow(): Promise<void> {
   if (isTauri) {
-    await tauriAutoAuth();
     throw redirect({ to: "/chat" });
   }
 
